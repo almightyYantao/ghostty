@@ -16,6 +16,7 @@ const input = @import("../input.zig");
 const internal_os = @import("../os/main.zig");
 const renderer = @import("../renderer.zig");
 const terminal = @import("../terminal/main.zig");
+const termio = @import("../termio.zig");
 const CoreApp = @import("../App.zig");
 const CoreInspector = @import("../inspector/main.zig").Inspector;
 const CoreSurface = @import("../Surface.zig");
@@ -458,6 +459,20 @@ pub const Surface = struct {
     /// that getTitle works without the implementer needing to save it.
     title: ?[:0]const u8 = null,
 
+    /// Set when the embedder owns the pty (io_mode = manual).
+    manual_io: ?termio.Manual.Config = null,
+
+    /// How the surface's terminal IO is performed. C type: ghostty_surface_io_mode_e
+    pub const IoMode = enum(c_int) {
+        /// Ghostty spawns the command in its own pty (default).
+        exec = 0,
+
+        /// The embedder owns the pty/transport: no process is spawned,
+        /// child output is fed with ghostty_surface_io_feed and bytes for
+        /// the child are delivered to io_write_cb.
+        manual = 1,
+    };
+
     /// Surface initialization options.
     pub const Options = extern struct {
         /// The platform that this surface is being initialized for and
@@ -499,6 +514,20 @@ pub const Surface = struct {
 
         /// Context for the new surface
         context: apprt.surface.NewSurfaceContext = .window,
+
+        /// Terminal IO mode. With `.manual`, `command`, `env_vars` and
+        /// shell integration are ignored and the io_* callbacks are used.
+        io_mode: IoMode = .exec,
+
+        /// Passed to io_write_cb / io_resize_cb. Separate from `userdata`
+        /// because these callbacks run on Ghostty's IO thread.
+        io_userdata: ?*anyopaque = null,
+
+        /// Bytes destined for the child (manual mode). IO thread.
+        io_write_cb: ?termio.Manual.WriteFn = null,
+
+        /// Grid size changed (manual mode): cols, rows, width_px, height_px.
+        io_resize_cb: ?termio.Manual.ResizeFn = null,
     };
 
     pub fn init(self: *Surface, app: *App, opts: Options) !void {
@@ -513,6 +542,14 @@ pub const Surface = struct {
             },
             .size = .{ .width = 800, .height = 600 },
             .cursor_pos = .{ .x = -1, .y = -1 },
+            .manual_io = switch (opts.io_mode) {
+                .exec => null,
+                .manual => .{
+                    .userdata = opts.io_userdata,
+                    .write_cb = opts.io_write_cb,
+                    .resize_cb = opts.io_resize_cb,
+                },
+            },
         };
 
         // Add ourselves to the list of surfaces on the app.
@@ -1212,6 +1249,11 @@ pub const Surface = struct {
         };
     }
 
+    /// Called by the core surface to choose its termio backend.
+    pub fn manualIoConfig(self: *const Surface) ?termio.Manual.Config {
+        return self.manual_io;
+    }
+
     pub fn defaultTermioEnv(self: *const Surface) !std.process.Environ.Map {
         _ = self;
         var env = try global.environMap();
@@ -1897,6 +1939,33 @@ pub const CAPI = struct {
     /// Returns true if the surface process has exited.
     export fn ghostty_surface_process_exited(surface: *Surface) bool {
         return surface.core_surface.child_exited;
+    }
+
+    /// Feed child output into the terminal (io_mode = manual). The bytes
+    /// are copied; parsing happens on Ghostty's feed thread in order, then
+    /// a render is scheduled. Safe to call from any thread. No-op for
+    /// exec surfaces.
+    export fn ghostty_surface_io_feed(
+        surface: *Surface,
+        ptr: [*]const u8,
+        len: usize,
+    ) void {
+        switch (surface.core_surface.io.backend) {
+            .manual => |*m| m.feed(ptr[0..len]),
+            .exec => {},
+        }
+    }
+
+    /// Report that the embedder's child exited (io_mode = manual). Delivered
+    /// after all previously fed bytes are parsed; then the surface behaves as
+    /// for an exec child exit (show_child_exited action, "Process exited"
+    /// text or close_surface_cb depending on wait-after-command). Safe to
+    /// call from any thread; only the first call counts.
+    export fn ghostty_surface_io_exited(surface: *Surface, exit_code: i32) void {
+        switch (surface.core_surface.io.backend) {
+            .manual => |*m| m.exited(@bitCast(exit_code)),
+            .exec => {},
+        }
     }
 
     /// Returns true if the surface has a selection.

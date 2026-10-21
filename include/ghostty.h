@@ -505,6 +505,32 @@ typedef enum {
   GHOSTTY_SURFACE_CONTEXT_SPLIT = 2,
 } ghostty_surface_context_e;
 
+// How a surface performs terminal IO.
+//   EXEC:   Ghostty spawns `command` (or the configured shell) in its own pty.
+//   MANUAL: the embedder owns the pty/transport. No process is spawned, no
+//           login(1) wrapper, no shell-integration env. Child output goes in
+//           via ghostty_surface_io_feed; everything Ghostty would write to the
+//           pty (keys, paste, query replies, mouse/focus reports) comes out
+//           via io_write_cb; grid size changes come out via io_resize_cb.
+typedef enum {
+  GHOSTTY_SURFACE_IO_EXEC = 0,
+  GHOSTTY_SURFACE_IO_MANUAL = 1,
+} ghostty_surface_io_mode_e;
+
+// Bytes destined for the child. Called on Ghostty's IO thread (and, for the
+// very first writes, possibly before ghostty_surface_new returns). The buffer
+// is only valid during the call. Must not block and must not call any
+// ghostty_surface_* function synchronously (the terminal lock may be held).
+typedef void (*ghostty_io_write_cb)(void*, const uint8_t*, size_t);
+
+// The terminal grid size changed: columns, rows, width_px, height_px (the
+// terminal area in pixels, padding excluded). Called once per actual change:
+// first from ghostty_surface_new (initial size, caller's thread), later from
+// Ghostty's IO thread with the terminal lock held, so a redraw fed after
+// TIOCSWINSZ is parsed at the new size. Same restrictions as io_write_cb;
+// calling ioctl(TIOCSWINSZ) directly in the callback is fine.
+typedef void (*ghostty_io_resize_cb)(void*, uint16_t, uint16_t, uint32_t, uint32_t);
+
 typedef struct {
   ghostty_platform_e platform_tag;
   ghostty_platform_u platform;
@@ -518,6 +544,10 @@ typedef struct {
   const char* initial_input;
   bool wait_after_command;
   ghostty_surface_context_e context;
+  ghostty_surface_io_mode_e io_mode;
+  void* io_userdata;
+  ghostty_io_write_cb io_write_cb;
+  ghostty_io_resize_cb io_resize_cb;
 } ghostty_surface_config_s;
 
 typedef struct {
@@ -1184,6 +1214,15 @@ GHOSTTY_API ghostty_surface_config_s ghostty_surface_inherited_config(ghostty_su
 GHOSTTY_API void ghostty_surface_update_config(ghostty_surface_t, ghostty_config_t);
 GHOSTTY_API bool ghostty_surface_needs_confirm_quit(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_process_exited(ghostty_surface_t);
+// Manual IO (io_mode = GHOSTTY_SURFACE_IO_MANUAL); no-ops for exec surfaces.
+// Both are thread-safe and never block on parsing: feed copies the bytes and
+// Ghostty parses them in order on its own feed thread, then renders.
+// io_exited is delivered after all previously fed bytes; only the first call
+// counts. After it, io_write_cb is no longer called.
+GHOSTTY_API void ghostty_surface_io_feed(ghostty_surface_t,
+                                         const uint8_t*,
+                                         uintptr_t);
+GHOSTTY_API void ghostty_surface_io_exited(ghostty_surface_t, int32_t);
 GHOSTTY_API void ghostty_surface_refresh(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_draw(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_set_content_scale(ghostty_surface_t, double, double);
