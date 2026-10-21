@@ -1281,6 +1281,12 @@ GHOSTTY_API bool ghostty_surface_read_selection(ghostty_surface_t, ghostty_text_
 GHOSTTY_API bool ghostty_surface_read_text(ghostty_surface_t,
                                               ghostty_selection_s,
                                               ghostty_text_s*);
+// Output of the last finished command, delimited by OSC 133 prompt marks on
+// the active screen (requires shell integration marks in the byte stream).
+// False if unavailable or empty. Free with ghostty_surface_free_text. Any
+// thread (takes the terminal lock); do not call from io_* callbacks.
+GHOSTTY_API bool ghostty_surface_read_last_command_output(ghostty_surface_t,
+                                                          ghostty_text_s*);
 GHOSTTY_API void ghostty_surface_free_text(ghostty_surface_t, ghostty_text_s*);
 
 #ifdef __APPLE__

@@ -2010,6 +2010,37 @@ pub const CAPI = struct {
         return readTextLocked(surface, core_sel, result);
     }
 
+    /// Read the output of the last finished command, delimited by the
+    /// semantic prompt marks (OSC 133) on the active screen: the output
+    /// between the previous prompt and the current one (or, while a command
+    /// is running, the one before it). Trailing blank cells are trimmed.
+    /// Returns false without shell integration marks or if that command
+    /// printed nothing. Free the result with ghostty_surface_free_text.
+    export fn ghostty_surface_read_last_command_output(
+        surface: *Surface,
+        result: *Text,
+    ) bool {
+        surface.core_surface.renderer_state.mutex.lockUncancelable(global.io());
+        defer surface.core_surface.renderer_state.mutex.unlock(global.io());
+
+        const screen = surface.core_surface.renderer_state.terminal.screens.active;
+        var it = screen.cursor.page_pin.promptIterator(.left_up, null);
+        _ = it.next() orelse return false; // current prompt / running command
+        const prompt = it.next() orelse return false;
+        var hl = screen.pages.highlightSemanticContent(
+            prompt,
+            .output,
+        ) orelse return false;
+
+        var cell_it = hl.end.cellIterator(.left_up, hl.start);
+        while (cell_it.next()) |p| {
+            hl.end = p;
+            if (p.rowAndCell().cell.hasText()) break;
+        }
+
+        return readTextLocked(surface, .init(hl.start, hl.end, false), result);
+    }
+
     fn readTextLocked(
         surface: *Surface,
         core_sel: terminal.Selection,
