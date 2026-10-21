@@ -184,6 +184,10 @@ command_timer: ?std.Io.Timestamp = null,
 /// Search state
 search: ?Search = null,
 
+/// Search option applied to new and running searches (see
+/// setSearchCaseSensitive).
+search_case_sensitive: bool = false,
+
 /// Used to rate limit BEL handling.
 last_bell_time: ?std.Io.Timestamp = null,
 
@@ -800,6 +804,15 @@ pub fn init(
 
     // We are no longer the first surface
     app.first = false;
+}
+
+/// Match search case exactly (true) or ASCII case-insensitively (false,
+/// the default). Applies to the running search, if any, and later ones.
+pub fn setSearchCaseSensitive(self: *Surface, v: bool) void {
+    self.search_case_sensitive = v;
+    const s: *Search = if (self.search) |*s| s else return;
+    _ = s.state.mailbox.push(global.io(), .{ .case_sensitive = v }, .forever);
+    s.state.wakeup.notify() catch {};
 }
 
 /// Create the exec (subprocess + pty) termio backend.
@@ -5149,6 +5162,12 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
                     .{&s.state},
                 );
                 s.thread.setName(global.io(), "search") catch {};
+
+                if (self.search_case_sensitive) _ = s.state.mailbox.push(
+                    global.io(),
+                    .{ .case_sensitive = true },
+                    .forever,
+                );
 
                 break :init s;
             };

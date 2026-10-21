@@ -2367,6 +2367,16 @@ pub const CAPI = struct {
         };
     }
 
+    /// Match search case exactly (true) or ASCII case-insensitively (false,
+    /// the default). Applies to the running search and later `search:`
+    /// binding actions on this surface. Main thread.
+    export fn ghostty_surface_set_search_case_sensitive(
+        surface: *Surface,
+        case_sensitive: bool,
+    ) void {
+        surface.core_surface.setSearchCaseSensitive(case_sensitive);
+    }
+
     /// Invoke an action on the surface.
     export fn ghostty_surface_binding_action(
         ptr: *Surface,

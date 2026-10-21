@@ -35,6 +35,18 @@ const FlattenedHighlight = terminal.highlight.Flattened;
 /// it will contain pointers to them in order to return selections. If any
 /// pages become invalid, the caller should clear the sliding window and
 /// start over.
+/// Match case exactly instead of ASCII case-insensitively. Thread-local so
+/// that each search thread (one per surface) carries its own setting without
+/// threading an option through every search layer; set by search.Thread.
+pub threadlocal var case_sensitive: bool = false;
+
+inline fn find(haystack: []const u8, needle: []const u8) ?usize {
+    return if (case_sensitive)
+        std.mem.indexOf(u8, haystack, needle)
+    else
+        std.ascii.findIgnoreCase(haystack, needle);
+}
+
 pub const SlidingWindow = struct {
     /// The allocator to use for all the data within this window. We
     /// store this rather than passing it around because its already
@@ -193,7 +205,7 @@ pub const SlidingWindow = struct {
         };
 
         // Search the first slice for the needle.
-        if (std.ascii.findIgnoreCase(slices[0], self.needle)) |idx| {
+        if (find(slices[0], self.needle)) |idx| {
             return self.highlight(
                 idx,
                 self.needle.len,
@@ -219,7 +231,7 @@ pub const SlidingWindow = struct {
             @memcpy(self.overlap_buf[prefix.len..overlap_len], suffix);
 
             // Search the overlap
-            const idx = std.ascii.findIgnoreCase(
+            const idx = find(
                 self.overlap_buf[0..overlap_len],
                 self.needle,
             ) orelse break :overlap;
@@ -233,7 +245,7 @@ pub const SlidingWindow = struct {
         }
 
         // Search the last slice for the needle.
-        if (std.ascii.findIgnoreCase(slices[1], self.needle)) |idx| {
+        if (find(slices[1], self.needle)) |idx| {
             return self.highlight(
                 slices[0].len + idx,
                 self.needle.len,

@@ -1266,6 +1266,9 @@ GHOSTTY_API void ghostty_surface_split_resize(ghostty_surface_t,
                                                  ghostty_action_resize_split_direction_e,
                                                  uint16_t);
 GHOSTTY_API void ghostty_surface_split_equalize(ghostty_surface_t);
+// Search matches case exactly (true) or ASCII case-insensitively (false,
+// default) for the running and later `search:` actions. Main thread.
+GHOSTTY_API void ghostty_surface_set_search_case_sensitive(ghostty_surface_t, bool);
 GHOSTTY_API bool ghostty_surface_binding_action(ghostty_surface_t, const char*, uintptr_t);
 GHOSTTY_API void ghostty_surface_complete_clipboard_request(
     ghostty_surface_t,

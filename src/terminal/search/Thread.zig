@@ -25,6 +25,7 @@ const ScreenSet = @import("../ScreenSet.zig");
 const Terminal = @import("../Terminal.zig");
 
 const ScreenSearch = @import("screen.zig").ScreenSearch;
+const sliding_window = @import("sliding_window.zig");
 const TerminalSearch = @import("terminal.zig").TerminalSearch;
 
 const log = std.log.scoped(.search_thread);
@@ -263,6 +264,7 @@ fn drainMailbox(self: *Thread) !void {
                 try self.changeNeedle(v.slice());
             },
             .select => |v| try self.select(v),
+            .case_sensitive => |v| try self.setCaseSensitive(v),
         }
     }
 }
@@ -281,6 +283,18 @@ fn select(self: *Thread, sel: ScreenSearch.Select) !void {
     }
 }
 
+fn setCaseSensitive(self: *Thread, v: bool) !void {
+    if (sliding_window.case_sensitive == v) return;
+    sliding_window.case_sensitive = v;
+
+    // Restart an active search so existing matches are recomputed.
+    const s = if (self.search) |*s| s else return;
+    const needle = try self.alloc.dupe(u8, s.needle());
+    defer self.alloc.free(needle);
+    try self.changeNeedle("");
+    try self.changeNeedle(needle);
+}
+
 /// Change the search term to the given value.
 fn changeNeedle(self: *Thread, needle: []const u8) !void {
     log.debug("changing search needle to '{s}'", .{needle});
@@ -288,7 +302,10 @@ fn changeNeedle(self: *Thread, needle: []const u8) !void {
     // Stop the previous search
     if (self.search) |*s| {
         // If our search is unchanged, do nothing.
-        if (std.ascii.eqlIgnoreCase(s.needle(), needle)) return;
+        if (if (sliding_window.case_sensitive)
+            std.mem.eql(u8, s.needle(), needle)
+        else
+            std.ascii.eqlIgnoreCase(s.needle(), needle)) return;
 
         {
             self.opts.mutex.lockUncancelable(global.io());
@@ -536,6 +553,10 @@ pub const Message = union(enum) {
 
     /// Select a search result.
     select: ScreenSearch.Select,
+
+    /// Match case exactly (true) or ASCII case-insensitively (false,
+    /// default). Restarts an active search when the value changes.
+    case_sensitive: bool,
 };
 
 /// Events that can be emitted from the search thread. The caller
