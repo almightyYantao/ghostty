@@ -12,6 +12,8 @@ const Screen = terminal.Screen;
 const Terminal = terminal.Terminal;
 const PageFormatter = @import("../formatter.zig").PageFormatter;
 const FlattenedHighlight = terminal.highlight.Flattened;
+const regex = @import("regex.zig");
+const log = std.log.scoped(.search_window);
 
 /// Searches page nodes via a sliding window. The sliding window maintains
 /// the invariant that data isn't pruned until (1) we've searched it and
@@ -39,6 +41,11 @@ const FlattenedHighlight = terminal.highlight.Flattened;
 /// that each search thread (one per surface) carries its own setting without
 /// threading an option through every search layer; set by search.Thread.
 pub threadlocal var case_sensitive: bool = false;
+
+/// Treat the needle as an Oniguruma regular expression (Wireline fork).
+/// Read when a window is created, so toggling it requires a new search.
+/// Same thread-local scheme as `case_sensitive`.
+pub threadlocal var use_regex: bool = false;
 
 inline fn find(haystack: []const u8, needle: []const u8) ?usize {
     return if (case_sensitive)
@@ -95,6 +102,9 @@ pub const SlidingWindow = struct {
     /// ends on another. The length is always `needle.len * 2`.
     overlap_buf: []u8,
 
+    /// Regex mode state, null for literal search. See `nextRegex`.
+    rx: ?Rx = null,
+
     const Direction = enum { forward, reverse };
     const DataBuf = CircBuf(u8, 0);
     const MetaBuf = CircBuf(Meta, undefined);
@@ -106,6 +116,33 @@ pub const SlidingWindow = struct {
 
         pub fn deinit(self: *Meta, alloc: Allocator) void {
             self.cell_map.deinit(alloc);
+        }
+    };
+
+    /// Regex search matches whole logical lines: text between '\n' bytes in
+    /// the data buffer. Lines are copied out in screen order, matched, and
+    /// the resulting ranges queued (as data indices, in search order) until
+    /// `next()` hands them out one by one.
+    const Rx = struct {
+        /// Null when the pattern failed to compile: the search never matches.
+        matcher: ?regex.Matcher,
+        line: std.ArrayList(u8) = .empty,
+        ranges: std.ArrayList(regex.Range) = .empty,
+        pending: std.ArrayList(Pending) = .empty,
+        pending_i: usize = 0,
+
+        /// A queued match: absolute index into `data` and byte length.
+        const Pending = struct { start: usize, len: usize };
+
+        /// A logical line without a '\n' yet is matched anyway once it
+        /// reaches this size, bounding memory for endless unwrapped output.
+        const max_line_len = 1024 * 1024;
+
+        fn deinit(self: *Rx, alloc: Allocator) void {
+            if (self.matcher) |*m| m.deinit();
+            self.line.deinit(alloc);
+            self.ranges.deinit(alloc);
+            self.pending.deinit(alloc);
         }
     };
 
@@ -141,6 +178,10 @@ pub const SlidingWindow = struct {
         const overlap_buf = try alloc.alloc(u8, needle.len * 2);
         errdefer alloc.free(overlap_buf);
 
+        const rx: ?Rx = if (use_regex and needle_unowned.len > 0) .{
+            .matcher = regex.Matcher.init(needle_unowned, case_sensitive),
+        } else null;
+
         return .{
             .alloc = alloc,
             .data = data,
@@ -149,10 +190,12 @@ pub const SlidingWindow = struct {
             .needle = needle,
             .direction = direction,
             .overlap_buf = overlap_buf,
+            .rx = rx,
         };
     }
 
     pub fn deinit(self: *SlidingWindow) void {
+        if (self.rx) |*rx| rx.deinit(self.alloc);
         self.alloc.free(self.overlap_buf);
         self.alloc.free(self.needle);
         self.chunk_buf.deinit(self.alloc);
@@ -170,6 +213,19 @@ pub const SlidingWindow = struct {
         self.meta.clear();
         self.data.clear();
         self.data_offset = 0;
+        if (self.rx) |*rx| {
+            rx.pending.clearRetainingCapacity();
+            rx.pending_i = 0;
+        }
+    }
+
+    /// How many bytes of soft-wrapped neighbouring pages a caller should
+    /// load around the region it searches so that matches crossing the
+    /// region edge are found. Regex matches can be as long as the logical
+    /// line, so in regex mode every wrapped neighbour is needed.
+    pub fn overlapLen(self: *const SlidingWindow) usize {
+        if (self.rx != null) return std.math.maxInt(usize);
+        return self.needle.len -| 1;
     }
 
     /// Search the window for the next occurrence of the needle. As
@@ -192,6 +248,7 @@ pub const SlidingWindow = struct {
         // would otherwise produce a zero-length match, which highlight()
         // cannot represent because its end offset is inclusive.
         if (self.needle.len == 0) return null;
+        if (self.rx != null) return self.nextRegex();
 
         const slices = slices: {
             // If we have less data then the needle then we can't possibly match
@@ -309,6 +366,120 @@ pub const SlidingWindow = struct {
 
         self.assertIntegrity();
         return null;
+    }
+
+    /// Regex mode `next()`: hand out queued matches, otherwise match the
+    /// next complete logical line. A line is complete once its terminating
+    /// '\n' is in the window; an incomplete trailing line stays until more
+    /// pages are appended (or it grows past `Rx.max_line_len`).
+    fn nextRegex(self: *SlidingWindow) ?FlattenedHighlight {
+        const rx = &self.rx.?;
+        const matcher = if (rx.matcher) |*m| m else return null;
+        while (true) {
+            if (rx.pending_i < rx.pending.items.len) return self.emitPending(rx);
+            rx.pending.clearRetainingCapacity();
+            rx.pending_i = 0;
+            if (!self.matchLine(rx, matcher)) {
+                self.pruneRegex();
+                self.assertIntegrity();
+                return null;
+            }
+        }
+    }
+
+    /// Match the line starting at `data_offset` and queue its matches.
+    /// Returns false if there is no complete line to match.
+    fn matchLine(self: *SlidingWindow, rx: *Rx, matcher: *regex.Matcher) bool {
+        const len = self.data.len();
+        if (self.data_offset >= len) return false;
+        const avail = len - self.data_offset;
+        const slices = self.data.getPtrSlice(self.data_offset, avail);
+        const line_len: usize = if (std.mem.indexOfScalar(u8, slices[0], '\n')) |i|
+            i
+        else if (std.mem.indexOfScalar(u8, slices[1], '\n')) |i|
+            slices[0].len + i
+        else if (avail >= Rx.max_line_len)
+            avail
+        else
+            return false;
+        const line_start = self.data_offset;
+        self.data_offset += line_len + @intFromBool(line_len < avail);
+
+        // Copy the line out in screen order; reverse windows store it
+        // byte-reversed.
+        rx.line.clearRetainingCapacity();
+        rx.ranges.clearRetainingCapacity();
+        rx.line.ensureTotalCapacity(self.alloc, line_len) catch return self.skipLine();
+        const a = @min(line_len, slices[0].len);
+        rx.line.appendSliceAssumeCapacity(slices[0][0..a]);
+        rx.line.appendSliceAssumeCapacity(slices[1][0 .. line_len - a]);
+        if (self.direction == .reverse) std.mem.reverse(u8, rx.line.items);
+
+        matcher.findAll(self.alloc, rx.line.items, &rx.ranges) catch return self.skipLine();
+        rx.pending.ensureTotalCapacity(self.alloc, rx.ranges.items.len) catch return self.skipLine();
+
+        // Queue in search order with data indices. A screen-order range
+        // [s, e) of a reversed line sits at data [len - e, len - s).
+        switch (self.direction) {
+            .forward => for (rx.ranges.items) |r| rx.pending.appendAssumeCapacity(.{
+                .start = line_start + r.start,
+                .len = r.end - r.start,
+            }),
+            .reverse => {
+                var i = rx.ranges.items.len;
+                while (i > 0) {
+                    i -= 1;
+                    const r = rx.ranges.items[i];
+                    rx.pending.appendAssumeCapacity(.{
+                        .start = line_start + line_len - r.end,
+                        .len = r.end - r.start,
+                    });
+                }
+            },
+        }
+        return true;
+    }
+
+    fn skipLine(self: *SlidingWindow) bool {
+        log.warn("out of memory matching a line, skipping it", .{});
+        self.rx.?.ranges.clearRetainingCapacity();
+        return true;
+    }
+
+    /// Emit the next queued match. `highlight` prunes data before the
+    /// match and moves `data_offset`, so restore our line cursor and shift
+    /// the remaining queue by the pruned amount.
+    fn emitPending(self: *SlidingWindow, rx: *Rx) FlattenedHighlight {
+        const p = rx.pending.items[rx.pending_i];
+        rx.pending_i += 1;
+
+        const cursor = self.data_offset;
+        const before = self.data.len();
+        self.data_offset = 0;
+        const result = self.highlight(p.start, p.len);
+        const pruned = before - self.data.len();
+        self.data_offset = cursor - pruned;
+        for (rx.pending.items[rx.pending_i..]) |*q| q.start -= pruned;
+        return result;
+    }
+
+    /// Drop pages fully before `data_offset` (the start of the first
+    /// unmatched line).
+    fn pruneRegex(self: *SlidingWindow) void {
+        var meta_it = self.meta.iterator(.forward);
+        var count: usize = 0;
+        var consumed: usize = 0;
+        while (meta_it.next()) |meta| {
+            const n = meta.cell_map.items.len;
+            if (consumed + n > self.data_offset) break;
+            consumed += n;
+            count += 1;
+            meta.deinit(self.alloc);
+        }
+        if (count == 0) return;
+        self.meta.deleteOldest(count);
+        self.data.deleteOldest(consumed);
+        self.data_offset -= consumed;
     }
 
     /// Return a flattened highlight for the given start and length.
@@ -637,9 +808,17 @@ pub const SlidingWindow = struct {
         };
         assert(meta.cell_map.items.len == encoded.written().len);
 
+        // Regex mode matches complete logical lines, so the ends of the
+        // page list terminate a line too: the bottom here (forward) and
+        // the top below (reverse, after the encoding is reversed).
+        const rx_bottom = self.rx != null and self.direction == .forward and
+            node.next == null;
+        const rx_top = self.rx != null and self.direction == .reverse and
+            node.prev == null;
+
         // If the node we're adding isn't soft-wrapped, we add the
         // trailing newline.
-        if (!last_row_wrapped) {
+        if (!last_row_wrapped or rx_bottom) {
             encoded.writer.writeByte('\n') catch return error.OutOfMemory;
             try meta.cell_map.append(
                 self.alloc,
@@ -652,8 +831,8 @@ pub const SlidingWindow = struct {
 
         // If our written data is empty, then there is nothing to
         // add to our data set.
-        const written = encoded.written();
-        if (written.len == 0) {
+        var written = encoded.written();
+        if (written.len == 0 and !rx_top) {
             self.assertIntegrity();
             return .{
                 .content_len = 0,
@@ -669,6 +848,11 @@ pub const SlidingWindow = struct {
                 std.mem.reverse(u8, written);
                 std.mem.reverse(point.Coordinate, meta.cell_map.items);
             },
+        }
+        if (rx_top) {
+            encoded.writer.writeByte('\n') catch return error.OutOfMemory;
+            try meta.cell_map.append(self.alloc, .{ .x = 0, .y = 0 });
+            written = encoded.written();
         }
 
         // Ensure our buffers are big enough to store what we need.

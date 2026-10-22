@@ -121,7 +121,7 @@ pub const ViewportSearch = struct {
         // Add enough overlap to cover needle.len - 1 bytes (if it
         // exists) so we can cover the overlap. We only do this for the
         // soft-wrapped prior pages.
-        const overlap_len = self.window.needle.len -| 1;
+        const overlap_len = self.window.overlapLen();
         const entries = fingerprint.entries.items;
         var node_ = entries[0].node.prev;
         var added: usize = 0;

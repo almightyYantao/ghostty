@@ -59,6 +59,7 @@ pub const ActiveSearch = struct {
         // An empty needle represents an inactive search and has no overlap
         // or history to load.
         if (self.window.needle.len == 0) return null;
+        if (self.window.rx != null) return self.updateRegex(list);
 
         // First up, add enough pages to cover the active area.
         var rem: usize = list.rows;
@@ -91,6 +92,46 @@ pub const ActiveSearch = struct {
         }
 
         // Return the last node we added to our window.
+        return last_node;
+    }
+
+    /// `update` for regex mode (Wireline fork). Regex matches are found per
+    /// logical line, so the pages must be appended top-down and include
+    /// every soft-wrapped page above the active area that leads into it.
+    fn updateRegex(
+        self: *ActiveSearch,
+        list: *const PageList,
+    ) Allocator.Error!?*PageList.List.Node {
+        const alloc = self.window.alloc;
+        var nodes: std.ArrayList(*PageList.List.Node) = .empty;
+        defer nodes.deinit(alloc);
+
+        var rem: usize = list.rows;
+        var node_ = list.pages.last;
+        var last_node: ?*PageList.List.Node = null;
+        while (node_) |node| : (node_ = node.prev) {
+            try nodes.append(alloc, node);
+            last_node = node;
+            if (rem <= node.rows()) {
+                node_ = node.prev;
+                break;
+            }
+            rem -= node.rows();
+        }
+
+        while (node_) |node| : (node_ = node.prev) {
+            var preserved = try node.pagePreservingState(alloc);
+            defer preserved.deinit();
+            const page = preserved.page();
+            if (!page.getRow(page.size.rows - 1).wrap) break;
+            try nodes.append(alloc, node);
+        }
+
+        var i = nodes.items.len;
+        while (i > 0) {
+            i -= 1;
+            _ = try self.window.append(nodes.items[i]);
+        }
         return last_node;
     }
 

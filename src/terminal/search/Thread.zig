@@ -265,6 +265,7 @@ fn drainMailbox(self: *Thread) !void {
             },
             .select => |v| try self.select(v),
             .case_sensitive => |v| try self.setCaseSensitive(v),
+            .regex => |v| try self.setRegex(v),
         }
     }
 }
@@ -286,8 +287,18 @@ fn select(self: *Thread, sel: ScreenSearch.Select) !void {
 fn setCaseSensitive(self: *Thread, v: bool) !void {
     if (sliding_window.case_sensitive == v) return;
     sliding_window.case_sensitive = v;
+    try self.restartSearch();
+}
 
-    // Restart an active search so existing matches are recomputed.
+fn setRegex(self: *Thread, v: bool) !void {
+    if (sliding_window.use_regex == v) return;
+    sliding_window.use_regex = v;
+    try self.restartSearch();
+}
+
+/// Restart an active search so existing matches are recomputed with the
+/// current options.
+fn restartSearch(self: *Thread) !void {
     const s = if (self.search) |*s| s else return;
     const needle = try self.alloc.dupe(u8, s.needle());
     defer self.alloc.free(needle);
@@ -302,7 +313,7 @@ fn changeNeedle(self: *Thread, needle: []const u8) !void {
     // Stop the previous search
     if (self.search) |*s| {
         // If our search is unchanged, do nothing.
-        if (if (sliding_window.case_sensitive)
+        if (if (sliding_window.case_sensitive or sliding_window.use_regex)
             std.mem.eql(u8, s.needle(), needle)
         else
             std.ascii.eqlIgnoreCase(s.needle(), needle)) return;
@@ -557,6 +568,10 @@ pub const Message = union(enum) {
     /// Match case exactly (true) or ASCII case-insensitively (false,
     /// default). Restarts an active search when the value changes.
     case_sensitive: bool,
+
+    /// Treat the needle as an Oniguruma regex (true) or a literal (false,
+    /// default). Restarts an active search when the value changes.
+    regex: bool,
 };
 
 /// Events that can be emitted from the search thread. The caller

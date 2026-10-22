@@ -188,6 +188,9 @@ search: ?Search = null,
 /// setSearchCaseSensitive).
 search_case_sensitive: bool = false,
 
+/// Search option applied to new and running searches (see setSearchRegex).
+search_regex: bool = false,
+
 /// Used to rate limit BEL handling.
 last_bell_time: ?std.Io.Timestamp = null,
 
@@ -812,6 +815,16 @@ pub fn setSearchCaseSensitive(self: *Surface, v: bool) void {
     self.search_case_sensitive = v;
     const s: *Search = if (self.search) |*s| s else return;
     _ = s.state.mailbox.push(global.io(), .{ .case_sensitive = v }, .forever);
+    s.state.wakeup.notify() catch {};
+}
+
+/// Treat the search needle as an Oniguruma regular expression (true) or a
+/// literal (false, the default). Applies to the running search, if any,
+/// and later ones.
+pub fn setSearchRegex(self: *Surface, v: bool) void {
+    self.search_regex = v;
+    const s: *Search = if (self.search) |*s| s else return;
+    _ = s.state.mailbox.push(global.io(), .{ .regex = v }, .forever);
     s.state.wakeup.notify() catch {};
 }
 
@@ -5166,6 +5179,11 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
                 if (self.search_case_sensitive) _ = s.state.mailbox.push(
                     global.io(),
                     .{ .case_sensitive = true },
+                    .forever,
+                );
+                if (self.search_regex) _ = s.state.mailbox.push(
+                    global.io(),
+                    .{ .regex = true },
                     .forever,
                 );
 

@@ -2408,6 +2408,17 @@ pub const CAPI = struct {
         surface.core_surface.setSearchCaseSensitive(case_sensitive);
     }
 
+    /// Treat the search needle as an Oniguruma (Ruby syntax) regular
+    /// expression (true) or a literal (false, the default). Applies to the
+    /// running search and later `search:` binding actions on this surface.
+    /// Main thread.
+    export fn ghostty_surface_set_search_regex(
+        surface: *Surface,
+        regex: bool,
+    ) void {
+        surface.core_surface.setSearchRegex(regex);
+    }
+
     /// Invoke an action on the surface.
     export fn ghostty_surface_binding_action(
         ptr: *Surface,
