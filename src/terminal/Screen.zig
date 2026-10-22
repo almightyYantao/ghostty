@@ -2165,8 +2165,22 @@ pub inline fn resize(
         self.cursor.hyperlink = null;
     }
 
-    // Perform the resize operation.
+    // Clear any redrawable prompt *before* reflowing, and unwrap the cleared
+    // rows. Shells redraw their prompt relative to the cursor (zsh: up by the
+    // prompt's height, then reprint), so the prompt must keep its shape
+    // through the resize. Reflowing it first re-wraps prompt lines that no
+    // longer fit (a right-aligned segment, padded to the full width, wraps
+    // on every shrink), which moves the cursor further below the prompt
+    // start than the shell expects: the redraw lands too low, the old top
+    // rows stay above it, and over a drag they pile up as scattered copies.
+    // A blank, unwrapped prompt keeps its row count, so the redraw lands on
+    // its first row. Done after the last injected failure point; should the
+    // reflow itself run out of memory the prompt stays blank, and the shell
+    // redraws it anyway (the pty was resized first).
     try tw.check(.pages);
+    self.clearPromptForRedraw(opts.prompt_redraw);
+
+    // Perform the resize operation.
     try self.pages.resize(.{
         .rows = opts.rows,
         .cols = opts.cols,
@@ -2201,11 +2215,6 @@ pub inline fn resize(
         self.cursor.pending_wrap = false;
         self.cursorRight(1);
     }
-
-    // Clear any redrawable prompt after the fallible resize but before
-    // restoring the cursor style and hyperlink, so cleared cells retain the
-    // same default styling they had with the previous ordering.
-    self.clearPromptForRedraw(opts.prompt_redraw);
 
     // Restore the cursor style.
     self.cursor.style = cursor_style;
@@ -2326,6 +2335,8 @@ fn clearPromptForRedraw(
                 const row = self.cursor.page_row;
                 const cells = page.getCells(row);
                 self.clearCells(page, row, cells);
+                row.wrap = false;
+                row.wrap_continuation = false;
             },
 
             .true => {
@@ -2352,6 +2363,9 @@ fn clearPromptForRedraw(
                     const row = pin.rowAndCell().row;
                     const cells = page.getCells(row);
                     self.clearCells(page, row, cells);
+                    // Each row stays a row through the reflow (see resize).
+                    row.wrap = false;
+                    row.wrap_continuation = false;
                 }
             },
         }
