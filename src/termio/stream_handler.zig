@@ -20,10 +20,16 @@ const log = std.log.scoped(.io_handler);
 /// stateful and is expected to live for the entire lifetime of the terminal.
 /// It is NOT VALID to stop a stream handler, create a new one, and use that
 /// unless all of the member fields are copied.
+/// For handlers that aren't Termio's (tests): replies always on.
+const replies_always: std.atomic.Value(bool) = .init(true);
+
 pub const StreamHandler = struct {
     alloc: Allocator,
     size: *renderer.Size,
     terminal: *terminal.Terminal,
+
+    /// Whether replies are written back (Termio.replies_enabled).
+    replies: *const std.atomic.Value(bool) = &replies_always,
 
     /// Mailbox for data to the termio thread.
     termio_mailbox: *termio.Mailbox,
@@ -147,6 +153,15 @@ pub const StreamHandler = struct {
     }
 
     inline fn messageWriter(self: *StreamHandler, msg: termio.Message) void {
+        // Everything the stream writes is a reply to the program's own
+        // output (a query, or a report it enabled). See Termio.replies_enabled.
+        switch (msg) {
+            .write_small, .write_stable, .write_alloc => if (!self.replies.load(.acquire)) {
+                msg.deinit();
+                return;
+            },
+            else => {},
+        }
         self.termio_mailbox.send(msg, self.renderer_state.mutex);
         self.termio_messaged = true;
     }

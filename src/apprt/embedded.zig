@@ -1968,6 +1968,48 @@ pub const CAPI = struct {
         }
     }
 
+    /// Replace the terminal's state with a terminal snapshot from its
+    /// envelope through READY (io_mode = manual), in order with fed bytes:
+    /// output fed before it is parsed first, output fed after it continues
+    /// from the snapshot. For attaching to a pty another process has been
+    /// running. The surface keeps its size and configured colors. Copies
+    /// the bytes. Safe to call from any thread. No-op for exec surfaces.
+    export fn ghostty_surface_io_restore(
+        surface: *Surface,
+        ptr: [*]const u8,
+        len: usize,
+    ) void {
+        switch (surface.core_surface.io.backend) {
+            .manual => |*m| m.restore(ptr[0..len]),
+            .exec => {},
+        }
+    }
+
+    /// Prepend scrollback from the snapshot passed to
+    /// ghostty_surface_io_restore: whole records after READY, split right
+    /// after a PAGE record (or ending with FINISH). In order with fed bytes;
+    /// pages that no longer fit the live terminal are dropped. Copies the
+    /// bytes. Safe to call from any thread.
+    export fn ghostty_surface_io_restore_history(
+        surface: *Surface,
+        ptr: [*]const u8,
+        len: usize,
+    ) void {
+        switch (surface.core_surface.io.backend) {
+            .manual => |*m| m.restoreHistory(ptr[0..len]),
+            .exec => {},
+        }
+    }
+
+    /// Whether replies to the program's queries (device attributes, cursor,
+    /// color and size reports) go out through io_write_cb. Off when another
+    /// process answers them (a session agent owning the pty), so the program
+    /// never gets two answers; keys, pastes and mouse reports still go out.
+    /// Default on. Safe to call from any thread.
+    export fn ghostty_surface_io_set_replies(surface: *Surface, enabled: bool) void {
+        surface.core_surface.io.replies_enabled.store(enabled, .release);
+    }
+
     /// Returns true if the surface has a selection.
     export fn ghostty_surface_has_selection(surface: *Surface) bool {
         return surface.core_surface.hasSelection();

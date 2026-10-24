@@ -26,6 +26,13 @@
 //!     all previously fed bytes are parsed and produces the normal
 //!     child_exited surface message.
 //!
+//!   - Snapshots: `restore` (a terminal snapshot through READY) and
+//!     `restoreHistory` (whole history records after it) go through the same
+//!     queue as fed bytes, so they apply exactly between the bytes fed before
+//!     and after them. This is how an embedder whose pty lives in another
+//!     process (a session agent) attaches: restore the agent's snapshot, then
+//!     feed the output that followed the snapshot cut.
+//!
 //! Callbacks must not block for long and must not call back into the
 //! ghostty_surface_* API synchronously (the terminal lock may be held).
 const Manual = @This();
@@ -61,8 +68,9 @@ const Shared = struct {
     mutex: std.Io.Mutex = .init,
     cond: std.Io.Condition = .init,
 
-    /// Bytes fed but not yet parsed.
-    pending: std.ArrayList(u8) = .empty,
+    /// Work fed but not yet done, in order: bytes to parse and snapshot
+    /// pieces to apply. Consecutive feeds coalesce into one bytes item.
+    pending: std.ArrayList(Item) = .empty,
 
     /// Exit code reported by the embedder, delivered after pending bytes.
     exit_code: ?u32 = null,
@@ -80,6 +88,22 @@ const Shared = struct {
     last_size: ?[4]u32 = null,
 };
 
+/// One unit of queued work for the feed thread.
+const Item = union(enum) {
+    bytes: std.ArrayList(u8),
+    /// A snapshot from its envelope through READY (owned).
+    restore: []u8,
+    /// Whole snapshot records after READY (owned).
+    history: []u8,
+
+    fn deinit(self: *Item, alloc: Allocator) void {
+        switch (self.*) {
+            .bytes => |*b| b.deinit(alloc),
+            .restore, .history => |b| alloc.free(b),
+        }
+    }
+};
+
 pub fn init(alloc: Allocator, cfg: Config) !Manual {
     const shared = try alloc.create(Shared);
     shared.* = .{
@@ -94,6 +118,7 @@ pub fn deinit(self: *Manual) void {
     const s = self.shared;
     // threadExit joins the feed thread; if the IO thread never started
     // there is no thread to join.
+    for (s.pending.items) |*item| item.deinit(s.alloc);
     s.pending.deinit(s.alloc);
     s.alloc.destroy(s);
 }
@@ -227,8 +252,52 @@ pub fn feed(self: *Manual, data: []const u8) void {
     s.mutex.lockUncancelable(global.io());
     defer s.mutex.unlock(global.io());
     if (s.exit_code != null or s.quit) return;
-    s.pending.appendSlice(s.alloc, data) catch |err| {
+    appendBytes(s, data) catch |err| {
         log.err("dropping {d} fed bytes err={}", .{ data.len, err });
+        return;
+    };
+    s.cond.signal(global.io());
+}
+
+fn appendBytes(s: *Shared, data: []const u8) !void {
+    if (s.pending.items.len > 0) {
+        const last = &s.pending.items[s.pending.items.len - 1];
+        if (last.* == .bytes) return last.bytes.appendSlice(s.alloc, data);
+    }
+    var bytes: std.ArrayList(u8) = .empty;
+    errdefer bytes.deinit(s.alloc);
+    try bytes.appendSlice(s.alloc, data);
+    try s.pending.append(s.alloc, .{ .bytes = bytes });
+}
+
+/// Queue a snapshot (envelope through READY) to replace the terminal's
+/// state, in order with fed bytes. Thread-safe.
+pub fn restore(self: *Manual, data: []const u8) void {
+    self.queueSnapshot(.restore, data);
+}
+
+/// Queue whole snapshot history records (after READY) to prepend to the
+/// scrollback restored by `restore`, in order with fed bytes. Thread-safe.
+pub fn restoreHistory(self: *Manual, data: []const u8) void {
+    self.queueSnapshot(.history, data);
+}
+
+fn queueSnapshot(self: *Manual, comptime kind: std.meta.Tag(Item), data: []const u8) void {
+    if (data.len == 0) return;
+    const s = self.shared;
+    const copy = s.alloc.dupe(u8, data) catch |err| {
+        log.err("dropping {d}-byte snapshot piece err={}", .{ data.len, err });
+        return;
+    };
+    s.mutex.lockUncancelable(global.io());
+    defer s.mutex.unlock(global.io());
+    if (s.exit_code != null or s.quit) {
+        s.alloc.free(copy);
+        return;
+    }
+    s.pending.append(s.alloc, @unionInit(Item, @tagName(kind), copy)) catch |err| {
+        log.err("dropping {d}-byte snapshot piece err={}", .{ data.len, err });
+        s.alloc.free(copy);
         return;
     };
     s.cond.signal(global.io());
@@ -249,9 +318,12 @@ fn feedMain(
     io: *termio.Termio,
     surface_mailbox: @import("../apprt.zig").surface.Mailbox,
 ) void {
-    // Double buffer: parse one while the embedder appends to the other.
-    var local: std.ArrayList(u8) = .empty;
-    defer local.deinit(s.alloc);
+    // Double buffer: work through one while the embedder appends to the other.
+    var local: std.ArrayList(Item) = .empty;
+    defer {
+        for (local.items) |*item| item.deinit(s.alloc);
+        local.deinit(s.alloc);
+    }
     var exit_sent = false;
 
     s.mutex.lockUncancelable(global.io());
@@ -265,9 +337,16 @@ fn feedMain(
         if (s.quit) return;
 
         if (s.pending.items.len > 0) {
-            std.mem.swap(std.ArrayList(u8), &local, &s.pending);
+            std.mem.swap(std.ArrayList(Item), &local, &s.pending);
             s.mutex.unlock(global.io());
-            io.processOutput(local.items);
+            for (local.items) |*item| {
+                switch (item.*) {
+                    .bytes => |b| io.processOutput(b.items),
+                    .restore => |b| io.restoreSnapshot(b),
+                    .history => |b| io.restoreSnapshotHistory(b),
+                }
+                item.deinit(s.alloc);
+            }
             local.clearRetainingCapacity();
             s.mutex.lockUncancelable(global.io());
             continue;

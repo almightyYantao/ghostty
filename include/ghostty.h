@@ -1223,6 +1223,18 @@ GHOSTTY_API void ghostty_surface_io_feed(ghostty_surface_t,
                                          const uint8_t*,
                                          uintptr_t);
 GHOSTTY_API void ghostty_surface_io_exited(ghostty_surface_t, int32_t);
+// Attaching to a pty another process owns (a session agent): restore its
+// terminal snapshot (envelope through READY), then prepend history (whole
+// records after READY, split after PAGE records), both in order with fed
+// bytes. set_replies(false) stops query replies (DA, DSR, color and size
+// reports) going out through io_write_cb when that process answers them.
+GHOSTTY_API void ghostty_surface_io_restore(ghostty_surface_t,
+                                            const uint8_t*,
+                                            uintptr_t);
+GHOSTTY_API void ghostty_surface_io_restore_history(ghostty_surface_t,
+                                                    const uint8_t*,
+                                                    uintptr_t);
+GHOSTTY_API void ghostty_surface_io_set_replies(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_refresh(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_draw(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_set_content_scale(ghostty_surface_t, double, double);

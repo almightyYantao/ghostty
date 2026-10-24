@@ -73,6 +73,20 @@ last_cursor_reset: ?std.Io.Timestamp = null,
 /// to keep track of any state or if its already been freed.
 thread_enter_state: ?*ThreadEnterState = null,
 
+/// Whether replies to the program's queries (device attributes, cursor and
+/// color reports, size reports, ...) are written back. An embedder whose
+/// pty lives in another process that answers them itself (a session agent)
+/// turns this off, so the program never gets two answers. Read from the
+/// stream handler while parsing; set from any thread.
+replies_enabled: std.atomic.Value(bool) = .init(true),
+
+/// History still to come for a snapshot restored by `restoreSnapshot`.
+restore: ?Restore = null,
+
+const Restore = struct {
+    decoder: terminalpkg.snapshot.Decoder,
+};
+
 /// The state we need to keep around only until we enter the IO
 /// thread. Then we can throw it all away.
 const ThreadEnterState = struct {
@@ -320,6 +334,7 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
         .renderer_mailbox = opts.renderer_mailbox,
         .size = &self.size,
         .terminal = &self.terminal,
+        .replies = &self.replies_enabled,
         .osc_color_report_format = opts.config.osc_color_report_format,
         .clipboard_write = opts.config.clipboard_write,
         .clipboard_write_limit = opts.config.clipboard_write_limit,
@@ -462,6 +477,108 @@ pub inline fn queueWrite(
     try self.backend.queueWrite(self.alloc, td, data, linefeed);
 }
 
+/// Write a report the program asked for (or enabled), unless replies are
+/// turned off (see `replies_enabled`).
+inline fn queueReply(self: *Termio, td: *ThreadData, data: []const u8) !void {
+    if (!self.replies_enabled.load(.acquire)) return;
+    try self.queueWrite(td, data, false);
+}
+
+/// Replace the terminal with a snapshot's renderable state (its envelope
+/// through READY), as the start of attaching to a pty that has been running
+/// elsewhere. This surface's size and configured default colors are kept;
+/// the program's own color overrides, modes, screens, cursor and unfinished
+/// escape sequence come from the snapshot. History follows through
+/// `restoreSnapshotHistory`. Runs on the manual backend's feed thread, in
+/// order with fed bytes.
+pub fn restoreSnapshot(self: *Termio, bytes: []const u8) void {
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+    self.restore = null;
+    self.restoreSnapshotLocked(bytes) catch |err| {
+        log.warn("snapshot restore failed err={}", .{err});
+    };
+    self.terminal.flags.dirty.clear = true;
+    self.terminal_stream.handler.queueRender() catch {};
+    self.renderer_wakeup.notify() catch {};
+}
+
+fn restoreSnapshotLocked(self: *Termio, bytes: []const u8) !void {
+    var reader: std.Io.Reader = .fixed(bytes);
+    var decoder: terminalpkg.snapshot.Decoder = .init(&reader);
+    var decoded = try decoder.ready(self.alloc, global.io(), .{
+        .max_continuation_bytes = 1024 * 1024,
+        .compress_history = true,
+    });
+    defer decoded.deinit(self.alloc);
+
+    // Same address: the stream handler and the renderer keep pointing at it.
+    var old = self.terminal;
+    self.terminal = decoded.toOwned();
+    old.deinit(self.alloc);
+
+    // Defaults are this surface's (its theme); overrides stay the program's.
+    const colors = &self.terminal.colors;
+    colors.background.default = self.config.background.toTerminalRGB();
+    colors.foreground.default = self.config.foreground.toTerminalRGB();
+    colors.cursor.default = if (self.config.cursor_color) |c| c.toTerminalRGB() else null;
+    colors.palette.changeDefault(self.alloc, self.config.palette) catch
+        colors.palette.resetDefault(self.alloc);
+    self.terminal.flags.dirty.palette = true;
+
+    // The snapshot's size is the pty's; this surface's grid wins (the pty
+    // follows through resize_cb).
+    const grid_size = self.size.grid();
+    if (grid_size.columns != self.terminal.cols or grid_size.rows != self.terminal.rows) {
+        try self.terminal.resize(self.alloc, .{
+            .cols = grid_size.columns,
+            .rows = grid_size.rows,
+            .cell_size_px = .{
+                .width = self.size.cell.width,
+                .height = self.size.cell.height,
+            },
+        });
+    }
+    self.terminal.width_px = self.terminal.cols * self.size.cell.width;
+    self.terminal.height_px = self.terminal.rows * self.size.cell.height;
+
+    // A fresh parser, brought to the snapshot's mid-sequence state.
+    self.terminal_stream.parser.deinit();
+    self.terminal_stream.parser = .init();
+    self.terminal_stream.parser.osc_parser.alloc = self.alloc;
+    self.terminal_stream.utf8decoder = .{};
+    switch (decoded.continuation) {
+        .ground => {},
+        .bytes => |continuation| self.processOutputLocked(continuation),
+    }
+
+    self.restore = .{ .decoder = decoder };
+}
+
+/// Prepend history from whole snapshot records that follow READY, split
+/// after PAGE records. Pages that no longer fit (the screen was resized or
+/// replaced since READY) are dropped by the decoder. Feed thread.
+pub fn restoreSnapshotHistory(self: *Termio, bytes: []const u8) void {
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+    const r = if (self.restore) |*v| v else return;
+    var reader: std.Io.Reader = .fixed(bytes);
+    r.decoder.source = &reader;
+    while (reader.bufferedLen() > 0) {
+        const progress = r.decoder.next(self.alloc, &self.terminal) catch |err| {
+            log.warn("snapshot history failed err={}", .{err});
+            self.restore = null;
+            break;
+        };
+        if (progress == null) {
+            self.restore = null;
+            break;
+        }
+    }
+    self.terminal_stream.handler.queueRender() catch {};
+    self.renderer_wakeup.notify() catch {};
+}
+
 /// Update the configuration.
 pub fn changeConfig(self: *Termio, td: *ThreadData, config: *DerivedConfig) !void {
     // The remainder of this function is modifying terminal state or
@@ -581,7 +698,7 @@ fn sizeReportLocked(self: *Termio, td: *ThreadData, style: termio.Message.SizeRe
         report_size,
     );
 
-    try self.queueWrite(td, writer.buffered(), false);
+    try self.queueReply(td, writer.buffered());
 }
 
 /// Reset the synchronized output mode. This is usually called by timer
@@ -786,7 +903,7 @@ pub fn colorSchemeReportLocked(self: *Termio, td: *ThreadData, force: bool) !voi
     var buf: [terminalpkg.device_status.max_color_scheme_report_encode_size]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buf);
     try terminalpkg.device_status.encodeColorSchemeReport(&writer, scheme);
-    try self.queueWrite(td, writer.buffered(), false);
+    try self.queueReply(td, writer.buffered());
 }
 
 /// Sends a visibility report to the pty. Unforced reports are only sent while
@@ -810,7 +927,7 @@ pub fn visibilityReport(
         &writer,
         if (visible) .potentially_visible else .not_visible,
     );
-    try self.queueWrite(td, writer.buffered(), false);
+    try self.queueReply(td, writer.buffered());
 }
 
 /// ThreadData is the data created and stored in the termio thread
