@@ -514,8 +514,15 @@ fn restoreSnapshotLocked(self: *Termio, bytes: []const u8) !void {
 
     // Same address: the stream handler and the renderer keep pointing at it.
     var old = self.terminal;
+    const limits = old.screens.get(.primary).?.pages.limits;
     self.terminal = decoded.toOwned();
     old.deinit(self.alloc);
+
+    // Scrollback limits are this surface's (its config), not the snapshot's:
+    // with a smaller one, the first live output would evict restored history.
+    const none = std.math.maxInt(usize);
+    self.terminal.setScrollbackMaxBytes(if (limits.bytes.explicit == none) null else limits.bytes.explicit);
+    self.terminal.setScrollbackMaxLines(if (limits.lines.explicit == none) null else limits.lines.explicit);
 
     // Defaults are this surface's (its theme); overrides stay the program's.
     const colors = &self.terminal.colors;
