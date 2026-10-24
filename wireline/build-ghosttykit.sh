@@ -6,6 +6,8 @@
 # Builds from the current checkout (no fetch). Produces in out_dir (default wireline/out):
 #   GhosttyKit.xcframework/                 static libghostty-internal.a + ghostty.h + modulemap
 #   GhosttyKit.xcframework.zip + .sha256    SwiftPM binaryTarget(url:checksum:) input
+#   GhosttyVt/include, GhosttyVt/lib        libghostty-vt (headless terminal + snapshot
+#                                           codec) for Wireline's session agent
 #   share/ghostty, share/terminfo           runtime resources for Contents/Resources
 #   GHOSTTY-LICENSE, BUILD-INFO.txt         fork commit, upstream base, zig, xcode, sha256s
 #
@@ -41,6 +43,22 @@ start=$(date +%s)
 )
 echo "zig build took $(( $(date +%s) - start ))s"
 
+# libghostty-vt, from the same checkout: a separate zig build (emit-lib-vt
+# switches the library it produces). Only the macOS slice is kept.
+vt_prefix="$(mktemp -d)"
+(
+  cd "$SRC"
+  zig build -Doptimize=ReleaseFast -Demit-lib-vt=true -Demit-macos-app=false -Dsentry=false \
+    -Dxcframework-target="$TARGET" --prefix "$vt_prefix"
+)
+rm -rf "$OUT/GhosttyVt"
+mkdir -p "$OUT/GhosttyVt/lib"
+vt_slice="$(find "$vt_prefix/lib/ghostty-vt.xcframework" -maxdepth 1 -type d -name 'macos-*' | head -1)"
+cp -R "$vt_slice/Headers" "$OUT/GhosttyVt/include"
+rm -f "$OUT/GhosttyVt/include/module.modulemap"   # Wireline wraps it in its own C target
+cp "$vt_slice/libghostty-vt.a" "$OUT/GhosttyVt/lib/"
+rm -rf "$vt_prefix"
+
 rm -rf "$OUT/GhosttyKit.xcframework" "$OUT/share"
 cp -R "$SRC/macos/GhosttyKit.xcframework" "$OUT/"
 mkdir -p "$OUT/share/ghostty"
@@ -64,5 +82,6 @@ echo "$sum" > "$OUT/GhosttyKit.xcframework.zip.sha256"
   echo "built_at=$(date -u +%FT%TZ)"
   echo "zip_sha256=$sum"
   find "$OUT/GhosttyKit.xcframework" -name '*.a' -exec shasum -a 256 {} \;
-  du -sh "$OUT/GhosttyKit.xcframework" "$OUT/GhosttyKit.xcframework.zip" "$OUT/share"
+  shasum -a 256 "$OUT/GhosttyVt/lib/libghostty-vt.a"
+  du -sh "$OUT/GhosttyKit.xcframework" "$OUT/GhosttyKit.xcframework.zip" "$OUT/share" "$OUT/GhosttyVt"
 } | tee "$OUT/BUILD-INFO.txt"
